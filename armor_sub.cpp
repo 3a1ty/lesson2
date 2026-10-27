@@ -101,6 +101,7 @@ auto detect_armors(const cv::Mat& frame) {
     vector<vector<Point>> contours;
     vector<Vec4i> hierarchy;
     vector<Point2f> boxPts(4);
+    vector<RotatedRect> bars;
 
     split(frame, channels); //通道分离
     threshold(channels[0], binary, 220, 255, 0);//二值化
@@ -116,19 +117,22 @@ auto detect_armors(const cv::Mat& frame) {
         // 去除较小轮廓&fitEllipse的限制条件
         if (area < 5 || contours[i].size() <= 1)
             continue;//相当于就是把这段轮廓去除掉
-        // 用椭圆拟合区域得到外接矩形（特殊的处理方式：因为灯条是椭圆型的，所以用椭圆去拟合轮廓，再直接获取旋转外接矩形即可）
-        RotatedRect Light_Rec = fitEllipse(contours[i]);
+        RotatedRect Light_Rec = minAreaRect(contours[i]);
 
         // 长宽比和轮廓面积比限制（由于要考虑灯条的远近都被识别到，所以只需要看比例即可）
-        if (Light_Rec.size.width / Light_Rec.size.height > 4)
+        if (max(Light_Rec.size.width , Light_Rec.size.height) / min(Light_Rec.size.width , Light_Rec.size.height) > 20 || 
+        max(Light_Rec.size.width , Light_Rec.size.height) / min(Light_Rec.size.width , Light_Rec.size.height) < 3)
             continue;
         lightInfos.push_back(LightDescriptor(Light_Rec));
+        bars.push_back(Light_Rec);
     }
     //二重循环多条件匹配灯条
     for (size_t i = 0; i < lightInfos.size(); i++) {
         for (size_t j = i + 1; (j < lightInfos.size()); j++) {
             LightDescriptor& leftLight = lightInfos[i];
             LightDescriptor& rightLight = lightInfos[j];
+            RotatedRect left_rect = bars[i];
+            RotatedRect right_rect = bars[j];
             float angleGap_ = abs(leftLight.angle - rightLight.angle);
             //由于灯条长度会因为远近而受到影响，所以按照比值去匹配灯条
             float LenGap_ratio = abs(leftLight.length - rightLight.length) / max(leftLight.length, rightLight.length);
@@ -140,26 +144,83 @@ auto detect_armors(const cv::Mat& frame) {
             float yGap_ratio = yGap / meanLen;
             float xGap = abs(leftLight.center.x - rightLight.center.x);
             float xGap_ratio = xGap / meanLen;
-            float ratio = dis / meanLen;
+            float ratio = dis / max(max(leftLight.length, rightLight.length), max(leftLight.width, rightLight.width));
             //匹配不通过的条件
-            if (angleGap_ > 15 ||
-                LenGap_ratio > 1.0 ||
-                lengap_ratio > 0.8 ||
-                yGap_ratio > 1.5 ||
-                xGap_ratio > 2.2 ||
-                xGap_ratio < 0.8 ||
-                ratio > 3 ||
-                ratio < 0.8) {
-                continue;
-            }
+            if (
+                 ratio > 5 ||
+                 ratio < 1) {
+                 printf("不匹配的条件: LenGap_ratio: %f, lengap_ratio: %f, yGap_ratio: %f, xGap_ratio: %f, ratio: %f\n", LenGap_ratio, lengap_ratio, yGap_ratio, xGap_ratio, ratio);
+                 continue;
+             }
             //绘制矩形
-            Point center = Point((leftLight.center.x + rightLight.center.x) / 2, (leftLight.center.y + rightLight.center.y) / 2);
-            RotatedRect rect = RotatedRect(center, Size(dis, meanLen), (leftLight.angle + rightLight.angle) / 2);
-            Point2f vertices[4];
-            rect.points(vertices);
-            for (int i = 0; i < 4; i++) {
-                line(frame, vertices[i], vertices[(i + 1) % 4], Scalar(0, 0, 255), 2.2);
+            cv::Point2f left_vertices[4], right_vertices[4];
+            left_rect.points(left_vertices);
+            right_rect.points(right_vertices);
+
+            // 找左灯条的最上端 (p1) 和最下端 (p4)
+            cv::Point2f p1 = left_vertices[0];
+            cv::Point2f p4 = left_vertices[0];
+            // int k_1 = 1;
+            // int k_4 = 1;
+            // for (int k = 1; k < 4; k++) {
+            //     if (left_vertices[k].y < p1.y) p1 = left_vertices[k];k_1 = k;
+            //     if (left_vertices[k].y > p4.y) p4 = left_vertices[k];k_4 = k;
+            // }
+            // p1.x = (left_vertices[k_1].x + left_vertices[].x) / 2; // 左灯条的上边中点
+            // p4.x = (left_vertices[k_1].x + left_vertices[k_4].x) / 2; // 左灯条的下边中点
+            
+            std::sort(left_vertices, left_vertices + 4, [&](const cv::Point2f& a, const cv::Point2f& b) {
+            float angleA = std::atan2(a.y - leftLight.center.y, a.x - leftLight.center.x);
+            float angleB = std::atan2(b.y - leftLight.center.y, b.x - leftLight.center.x);
+            return angleA > angleB; 
+        });
+            std::sort(right_vertices, right_vertices + 4, [&](const cv::Point2f& a, const cv::Point2f& b) {
+            float angleA = std::atan2(a.y - rightLight.center.y, a.x - rightLight.center.x);
+            float angleB = std::atan2(b.y - rightLight.center.y, b.x - rightLight.center.x);
+            return angleA > angleB; 
+        });
+
+        int tl_index = 0;
+        float min_sum = left_vertices[0].x + left_vertices[0].y;
+        for (int i = 1; i < 4; i++) {
+            if (left_vertices[i].x + left_vertices[i].y < min_sum) {
+                min_sum = left_vertices[i].x + left_vertices[i].y;
+                tl_index = i;
             }
+        }
+        std::rotate(left_vertices, left_vertices + tl_index, left_vertices + 4);
+        
+        tl_index = 0;
+        min_sum = right_vertices[0].x + right_vertices[0].y;
+        for (int i = 1; i < 4; i++) {
+            if (right_vertices[i].x + right_vertices[i].y < min_sum) {
+                min_sum = right_vertices[i].x + right_vertices[i].y;
+                tl_index = i;
+            }
+        }
+        std::rotate(right_vertices, right_vertices + tl_index, right_vertices + 4);
+
+
+
+
+            // 找右灯条的最上端 (p2) 和最下端 (p3)
+            // cv::Point2f p2 = right_vertices[0];
+            // cv::Point2f p3 = right_vertices[0];
+            // int k_2 = 1;
+            // int k_3 = 1;
+            // for (int k = 1; k < 4; k++) {
+            //     if (right_vertices[k].y < p2.y) p2 = right_vertices[k];k_2 = k;
+            //     if (right_vertices[k].y > p3.y) p3 = right_vertices[k];k_3 = k;
+            // }
+            // p2.x = (right_vertices[k_2].x + right_vertices[k_3].x) / 2.0; // 右灯条的上边中点
+            // p3.x = (right_vertices[k_2].x + right_vertices[k_3].x) / 2.0; // 右灯条的下边中点
+
+            cv::line(frame, (left_vertices[0] + left_vertices[3]) / 2.0f, (right_vertices[3] + right_vertices[0]) / 2.0f, cv::Scalar(0, 255, 0), 2); // 顶边
+            cv::line(frame, (right_vertices[3] + right_vertices[0]) / 2.0f, (right_vertices[2] + right_vertices[1]) / 2.0f, cv::Scalar(0, 255, 0), 2); // 右边
+            cv::line(frame, (right_vertices[2] + right_vertices[1]) / 2.0f, (left_vertices[1] + left_vertices[2]) / 2.0f, cv::Scalar(0, 255, 0), 2); // 底边
+            cv::line(frame, (left_vertices[1] + left_vertices[2]) / 2.0f, (left_vertices[0] + left_vertices[3]) / 2.0f, cv::Scalar(0, 255, 0), 2); // 左边
+            
+            
         }
     }
 
